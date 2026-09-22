@@ -1,0 +1,23 @@
+# 说明：版本号取自本项目实际运行的虚拟环境（D:\pycharm\python_basic\.venv）
+# 精确复现可在自己的环境中执行： pip freeze > requirements.txt
+
+# ---- Agent 框架 ----
+langchain>=1.2.12
+langchain-core>=1.5.5
+langchain-community>=0.4.2
+langchain-text-splitters>=1.1.2
+langchain-deepseek>=1.0.1       # init_chat_model 的 "deepseek:" provider
+langchain-openai>=1.5.1         # init_chat_model 的 "openai:" provider + OpenAI 兼容嵌入接口
+
+# ---- 向量检索 ----
+pymilvus>=2.6.12                # Milvus 客户端
+
+# ---- Web 界面 ----
+streamlit>=1.60.0
+
+# ---- 基础工具 ----
+python-dotenv>=1.2.1
+pydantic>=2.13.4
+openai>=2.48.0
+requests>=2.31.0
+langsmith>=0.11.0               # 链路追踪（可选，不配 key 不影响运行）
