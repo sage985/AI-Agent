@@ -567,14 +567,14 @@ PII_PATTERN = re.compile("|".join([ID_CARD_RE, EMAIL_RE, PHONE_RE]))
 
 def _mask_match(m: re.Match) -> str:
     value = m.group(0)
-    if "@" in value:  # 邮箱：与 PIIMiddleware(mask) 一致，local 保留，域名打码只留顶级域
+    if "@" in value:  # 邮箱：local 前 6 位打码、域名保留（local 不足 6 位则全部打码）
         local, domain = value.split("@", 1)
-        parts = domain.split(".")
-        return f"{local}@****.{parts[-1]}" if len(parts) > 1 else f"{local}@****"
+        masked_local = ("*" * 6 + local[6:]) if len(local) > 6 else ("*" * len(local))
+        return f"{masked_local}@{domain}"
     if len(value) == 11:  # 手机号：**** + 尾 4 位
         return "****" + value[-4:]
-    # 身份证（18 位）：保留前 6 位地区码与后 4 位，中间 8 位打码
-    return value[:6] + "********" + value[-4:]
+    # 身份证（18 位）：保留前 10 位（地区码 + 出生年），后 8 位打码
+    return value[:10] + "********"
 
 
 def mask_pii(text: str) -> str:
@@ -583,7 +583,18 @@ def mask_pii(text: str) -> str:
     保证聊天气泡、本地会话文件、每轮重放给模型的历史三者一致都是掩码（PIIMiddleware
     只处理当轮最后一条用户消息，无法覆盖本项目自管历史重放场景，见 README 说明）。
     """
-    return PII_PATTERN.sub(_mask_match, text)
+    out, pos = [], 0
+    for m in PII_PATTERN.finditer(text):
+        value = m.group(0)
+        # 已打码邮箱（****** 紧贴的 local 残段，如 ******an@x.com 中的 an@x.com）
+        # 必须跳过，否则会被二次打码；同时保证重复调用幂等
+        if "@" in value and m.start() > 0 and text[m.start() - 1] == "*":
+            continue
+        out.append(text[pos:m.start()])
+        out.append(_mask_match(m))
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
 
 
 # 手机号检测器（PIIMiddleware 要求的固定返回格式，写法对应 chapter07-10 自定义检测器）
@@ -599,6 +610,15 @@ def detect_id_card(content: str):
     return [
         {"text": m.group(0), "start": m.start(), "end": m.end()}
         for m in re.finditer(ID_CARD_RE, content)
+    ]
+
+
+# 邮箱检测器：跳过已被入口 mask_pii 打码的 local 残段（前一个字符是 *），防止二次掩码
+def detect_email(content: str):
+    return [
+        {"text": m.group(0), "start": m.start(), "end": m.end()}
+        for m in re.finditer(EMAIL_RE, content)
+        if m.start() == 0 or content[m.start() - 1] != "*"
     ]
 
 
@@ -618,7 +638,7 @@ def build_agent(nick_name: str, nature: str):
             PIIMiddleware(pii_type="phone_number", strategy="mask",
                           detector=detect_phone_number, apply_to_input=True),
             PIIMiddleware(pii_type="email", strategy="mask",
-                          detector=EMAIL_RE, apply_to_input=True),
+                          detector=detect_email, apply_to_input=True),
             # 长对话自动摘要：消息超过24条时自动压缩历史，保留最近8条（chapter07-08）
             SummarizationMiddleware(
                 model=model,
