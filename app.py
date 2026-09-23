@@ -20,6 +20,8 @@ import json
 import re
 import time
 import uuid
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
 
 import streamlit as st
@@ -132,9 +134,147 @@ def custom_toast(message: str, icon: str = "✨", duration_ms: int = 2600):
     )
 
 
-def queue_toast(message: str, icon: str = "✨"):
-    """按钮回调里先入队再 rerun 的场景：rerun 后由 fragment 末尾统一弹出，避免 iframe 被二次执行销毁"""
-    st.session_state.setdefault("toast_queue", []).append((str(message), icon))
+# ============================== 常驻 JS 指令通道（toast / 新建会话即时清场） ==============================
+# 关键兼容点：当前 Streamlit 版本里 components.html 的 iframe 作为"全新 delta 节点"首次挂载时，
+# srcdoc 里的 <script> 不会执行；只有 iframe 已存在、srcdoc 被更新时脚本才可靠运行。
+# 因此 fragment 末尾【始终】渲染同一个通道 iframe（页面加载即挂载，空指令），
+# 之后所有指令都走"更新 srcdoc"路径下发；已执行指令 id 记在父窗口上做幂等去重。
+_JS_CHANNEL_HEAD = """
+<script>
+(function(){
+  var win = window.parent;
+  if (!win.__jsCmdDone) win.__jsCmdDone = {};
+  var cmds ="""
+
+_JS_CHANNEL_TAIL = """
+  function showToast(c){
+    var pdoc = win.document;
+    var box = pdoc.createElement('div');
+    box.style.cssText = 'position:fixed;right:24px;bottom:24px;z-index:999999;'
+      + 'background:rgba(38,39,48,.96);color:#fff;padding:12px 18px;border-radius:12px;'
+      + 'box-shadow:0 8px 28px rgba(0,0,0,.35);max-width:340px;display:flex;gap:8px;'
+      + 'align-items:center;pointer-events:none;'
+      + "font:14px/1.5 -apple-system,'Segoe UI','Microsoft YaHei',sans-serif;";
+    var ic = pdoc.createElement('span');
+    ic.textContent = c.icon;
+    ic.style.cssText = 'font-size:18px;';
+    var tx = pdoc.createElement('span');
+    tx.textContent = c.msg;
+    box.appendChild(ic); box.appendChild(tx);
+    pdoc.body.appendChild(box);
+    box.animate([
+      {opacity:0, transform:'translateY(12px) scale(.95)'},
+      {opacity:1, transform:'none', offset:0.12},
+      {opacity:1, offset:0.88},
+      {opacity:0, transform:'translateY(8px)'}
+    ], {duration:c.dur, easing:'ease', fill:'forwards'});
+    setTimeout(function(){ box.remove(); }, c.dur + 200);
+  }
+  // 新建会话后只做 fragment 级刷新（避免 st.rerun() 整页灰屏+空白等待）：
+  // JS 即时隐藏聊天气泡、输入框上方插欢迎条、同步顶部标题；只切 body class/加外来节点，
+  // 绝不删除 React 管理的 DOM，聊天 fragment 下次重跑时自行清场。
+  function clearChat(c){
+    var doc = win.document;
+    if (!doc.getElementById('__new_chat_style__')) {
+      var st = doc.createElement('style');
+      st.id = '__new_chat_style__';
+      st.textContent =
+        "body.__chat_cleared__ [data-testid='stMain'] [data-testid='stChatMessage']"
+        + "{display:none !important;}"
+        + "#__new_chat_welcome__{display:flex;gap:8px;align-items:center;margin:0 0 14px;"
+        + "padding:14px 18px;border:1px dashed rgba(255,255,255,.22);border-radius:14px;"
+        + "color:rgba(255,255,255,.72);font:15px/1.6 -apple-system,'Segoe UI','Microsoft YaHei',sans-serif;}";
+      doc.head.appendChild(st);
+    }
+    doc.body.classList.add('__chat_cleared__');
+    var old = doc.getElementById('__new_chat_welcome__');
+    if (old) old.remove();
+    var input = doc.querySelector("[data-testid='stMain'] [data-testid='stChatInput']");
+    if (input) {
+      var w = doc.createElement('div');
+      w.id = '__new_chat_welcome__';
+      w.textContent = '✨ 已开启新会话，发条消息打个招呼吧～';
+      input.parentElement.insertBefore(w, input);
+    }
+    // 顶部 caption（🎯 标题 · 会话文件）在主区域 fragment 之外，整页不重跑时手动同步
+    var cap = doc.querySelector("[data-testid='stMain'] [data-testid='stCaptionContainer']");
+    if (cap) cap.textContent = '🎯 ' + c.title + '  ·  会话文件: ' + c.name;
+  }
+  // 清场时机由服务端掌握：chat_display fragment 在"清场后第一条消息"那次 run 末尾下发
+  // cleanup（此时 React 已把旧气泡替换成新消息，绝不误删）。不用 DOM MutationObserver 猜测。
+  function cleanupChat(){
+    var doc = win.document;
+    doc.body.classList.remove('__chat_cleared__');
+    var w0 = doc.getElementById('__new_chat_welcome__');
+    if (w0) w0.remove();
+  }
+  for (var i=0;i<cmds.length;i++){
+    var c = cmds[i];
+    if (!c || win.__jsCmdDone[c.id]) continue;
+    win.__jsCmdDone[c.id] = 1;
+    try {
+      if (c.kind === 'toast') showToast(c);
+      else if (c.kind === 'clear') clearChat(c);
+      else if (c.kind === 'cleanup') cleanupChat();
+    } catch(e) {}
+  }
+})();
+</script>
+"""
+
+
+def _js_chan_append(cmd: dict):
+    """向常驻 JS 通道追加一条指令（toast/clear），带单调递增 id 供前端幂等去重"""
+    st.session_state['_js_chan_seq'] = st.session_state.get('_js_chan_seq', 0) + 1
+    cmd['id'] = st.session_state['_js_chan_seq']
+    st.session_state.setdefault('_js_chan_pending', []).append(cmd)
+
+
+def queue_toast(message: str, icon: str = "✨", duration_ms: int = 2600):
+    """按钮回调里先入队再 rerun：rerun 后由 fragment 末尾的常驻 JS 通道统一弹出"""
+    _js_chan_append({'kind': 'toast', 'msg': str(message), 'icon': icon, 'dur': duration_ms})
+
+
+def queue_clear_chat(session_name: str, title: str = "主对话"):
+    """新建会话即时清场指令（隐藏气泡+欢迎条+同步标题）；
+    同时挂起 cleanup：等 chat_display 在清场后第一条消息的那次 run 里下发，恢复气泡显示"""
+    _js_chan_append({'kind': 'clear', 'name': str(session_name), 'title': str(title)})
+    st.session_state['_chat_cleanup_pending'] = True
+
+
+def render_js_channel(cmds):
+    """渲染常驻 JS 通道 iframe【每次 fragment run 都要调用，空指令也调】：
+    iframe 常驻存活，指令随 srcdoc 更新可靠下发（首挂不执行脚本是本版 Streamlit 的已知行为）"""
+    components.html(
+        _JS_CHANNEL_HEAD + json.dumps(cmds or [], ensure_ascii=False) + _JS_CHANNEL_TAIL,
+        height=0,
+    )
+
+
+# 整页首次加载时兜底清理历史残留遮罩（处理旧版本脚本留下的 body class）。
+# 用 parent window 标志保证本页面生命周期内只跑一次：iframe 被重新挂载时不得重复执行，
+# 否则会把常驻通道 clearChat 刚加上的遮罩立刻清掉。
+def js_reset_chat_guard():
+    components.html(
+        """
+        <script>
+        (function(){
+          var win = window.parent;
+          if (win.__chatGuardReady) return;
+          win.__chatGuardReady = true;
+          var doc = win.document;
+          doc.body.classList.remove('__chat_cleared__');
+          var w = doc.getElementById('__new_chat_welcome__');
+          if (w) w.remove();
+          if (win.__newChatObserver__) {
+            try { win.__newChatObserver__.disconnect(); } catch(e) {}
+            win.__newChatObserver__ = null;
+          }
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
 # ============================== 文档加载与切分（chapter09） ==============================
 def _bigrams(s: str) -> set:
@@ -309,12 +449,22 @@ def get_milvus_rag():
     return None
 
 
+# Milvus 行数查询专用单线程池：用 future.result(timeout=) 给不可强杀的 gRPC 调用
+# 套一层墙钟超时，Milvus 503/卡顿时长查询只留在后台线程，不阻塞侧边栏 fragment
+_MILVUS_COUNT_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='milvus-cnt')
+
+
 @st.cache_data(ttl=20, show_spinner=False)
-def milvus_row_count(collection_name: str) -> int:
-    """行数查询走短时缓存：侧边栏每次整页重跑不再都联网查 Milvus，
-    新建/切换会话因此几乎无等待。重建同步后手动清缓存。"""
+def milvus_row_count(collection_name: str):
+    """行数查询走短时缓存；1.5 秒超时。Milvus 异常时侧边栏（新建/切换会话）不再被
+    同步卡 10 秒以上：返回 None 表示未知（UI 显示"统计中"），TTL 过期后自动重试。"""
     rag = get_milvus_rag()
-    return rag.row_count() if rag is not None else 0
+    if rag is None:
+        return 0
+    try:
+        return int(_MILVUS_COUNT_POOL.submit(rag.row_count).result(timeout=1.5))
+    except (Exception, FuturesTimeoutError):
+        return None
 
 
 # ============================== 长期记忆持久化（chapter08 思想） ==============================
@@ -359,9 +509,11 @@ class EmotionReport(BaseModel):
 
 
 def analyze_emotion(messages: list) -> EmotionReport:
-    """把最近对话交给 LLM 做结构化情感分析，返回 EmotionReport"""
+    """把最近对话交给 LLM 做结构化情感分析，返回 EmotionReport。
+    只取最近 10 轮、每条截断 200 字：情绪看最近语境即可，减少 token 加快返回。"""
     convo = "\n".join(
-        f"{'用户' if m['role'] == 'user' else '伴侣'}：{m['content']}" for m in messages[-12:]
+        f"{'用户' if m['role'] == 'user' else '伴侣'}：{m['content'][:200]}"
+        for m in messages[-10:]
     )
     analyzer = model.with_structured_output(EmotionReport)
     return analyzer.invoke([
@@ -1005,10 +1157,23 @@ def chat_display():
         else:
             response_message.write("（助手没有返回内容，请重试）")
 
+    # 新建会话清场后的第一条消息：本次 run 已把旧气泡整体重绘为新消息列表，
+    # 此刻下发 cleanup 恢复显示（时机由服务端掌握，不会像 DOM observer 那样误触发）。
+    # 通道 iframe 在本 fragment 内常驻，srcdoc 更新即可靠执行。
+    if st.session_state.get('_chat_cleanup_pending') and st.session_state.messages:
+        st.session_state['_chat_cleanup_pending'] = False
+        _js_chan_append({'kind': 'cleanup'})
+    render_js_channel(st.session_state.pop('_js_chan_pending', []))
+
 
 # ============================== 侧边栏（@st.fragment：fragment 内 rerun(scope='fragment') 才合法） ==============================
 @st.fragment
 def sidebar_panel():
+    # 指令通道最先渲染（height=0 不占位）：toast/新建会话清场的 delta 第一批下发，
+    # 不受下方 Milvus 行数等慢查询阻塞，遮罩即时出现
+    render_js_channel(st.session_state.get('_js_chan_pending'))
+    st.session_state['_js_chan_pending'] = []
+
     with st.sidebar:
         st.subheader('AI控制面板')
 
@@ -1019,7 +1184,12 @@ def sidebar_panel():
             st.session_state['session_title'] = ''  # 新会话还没聊，title 留空
             load_sessions.clear()
             load_session_titles.clear()             # 同时清 title 缓存
-            st.rerun()
+            queue_toast('已开启新会话', '✏️')
+            # 不做整页 st.rerun()（灰屏+空白等待）：仅 fragment 刷新侧边栏，
+            # 聊天区由 fragment 末尾常驻 JS 通道下发 clear 指令即时视觉清空，服务端消息已是空列表
+            queue_clear_chat(st.session_state.current_session,
+                            st.session_state.get('session_title') or '主对话')
+            st.rerun(scope="fragment")
 
         # ---------- 会话历史：从内存 dict 取 session_title，不再每次串行读 json ----------
         st.text('会话历史')
@@ -1097,12 +1267,20 @@ def sidebar_panel():
             if len(msgs) < 2:
                 st.warning('先聊几句再来分析吧～')
             else:
-                with st.spinner('正在分析最近对话的情绪...'):
-                    try:
-                        st.session_state.emotion_report = analyze_emotion(msgs)
-                        custom_toast('心情报告已生成', icon='💗')
-                    except Exception as e:
-                        st.error(f'分析失败（{e.__class__.__name__}），请稍后再试')
+                # 对话内容没变就复用上次报告，不重复等待 LLM
+                _emo_key = hashlib.md5(
+                    json.dumps(msgs[-10:], ensure_ascii=False).encode('utf-8')).hexdigest()
+                if st.session_state.get('emotion_key') == _emo_key and st.session_state.get('emotion_report'):
+                    queue_toast('报告已是最新，聊点新内容后我再更新～', '💗')
+                else:
+                    # spinner 即时可见；完成提示走常驻 JS 通道在本次 run 末尾稳定弹出
+                    with st.spinner('正在分析最近对话的情绪...'):
+                        try:
+                            st.session_state.emotion_report = analyze_emotion(msgs)
+                            st.session_state.emotion_key = _emo_key
+                            queue_toast('心情报告已生成', '💗')
+                        except Exception as e:
+                            st.error(f'分析失败（{e.__class__.__name__}），请稍后再试')
         rep = st.session_state.get('emotion_report')
         if rep:
             st.progress(rep.score / 100, text=f'心情指数 {rep.score}/100（{rep.mood}）')
@@ -1117,7 +1295,8 @@ def sidebar_panel():
                 p = milvus_rag.provider
                 st.caption(f"源: {p['name']} | {p['model']}({p['dim']}维)")
                 st.caption(f"库: {MILVUS_DB}/{milvus_rag.collection}")
-                st.caption(f"已入库知识块: **{milvus_row_count(milvus_rag.collection)}**")
+                _row_cnt = milvus_row_count(milvus_rag.collection)
+                st.caption(f"已入库知识块: **{_row_cnt if _row_cnt is not None else '统计中…'}**")
                 if st.button('重建并同步 knowledge.txt 到 Milvus', width='stretch', icon='🔄'):
                     with st.spinner('正在重建集合、切分、嵌入并写入 Milvus...'):
                         count = milvus_rag.ingest_file(recreate=True)
@@ -1133,10 +1312,6 @@ def sidebar_panel():
         st.caption(f"模型: {ACTIVE_MODEL_NAME} | 工具: 时间/天气/记忆/知识库"
                    + (" | Milvus向量检索✅" if milvus_rag is not None else " | 关键词检索"))
 
-    # rerun 结束前统一弹出排队的提示（每次点击都会重新挂载，连续切换必弹）
-    for _msg, _icon in st.session_state.pop("toast_queue", []):
-        custom_toast(_msg, icon=_icon)
-
 
 # ============================== 页面渲染 ==============================
 st.title("💕 AI智能伴侣")
@@ -1149,3 +1324,4 @@ st.caption(f"🎯 {_cur_title}  ·  会话文件: {_cur_ts}")
 
 sidebar_panel()  # 侧边栏（@st.fragment 保护：删除/切换等操作只局部刷新不灰屏）
 chat_display()   # 聊天区 fragment（含 chat_input，发送消息只局部刷新不灰屏）
+js_reset_chat_guard()  # 整页加载/整页 rerun 时兜底清除新建会话的临时遮罩
