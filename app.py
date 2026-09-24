@@ -1191,7 +1191,13 @@ def chat_display():
             )
             for chunk, _meta in stream:
                 if isinstance(chunk, ToolMessage):
-                    custom_toast(f"已检索知识库：{chunk.name}", icon="🔍")
+                    # 不同工具给不同反馈：检索类轻提示，记忆提交明确引导去侧边栏确认（HITL 关键入口），
+                    # 时间/天气/记忆召回高频且无感，不弹气泡避免打扰
+                    if chunk.name == "search_love_knowledge":
+                        custom_toast("已检索恋爱知识库", icon="🔍")
+                    elif chunk.name == "remember_user_info":
+                        custom_toast("有条新记忆等确认：侧边栏「🧠 待确认记忆」点 ✅ 后长期生效",
+                                     icon="🧠", duration_ms=4000)
                     continue
                 if not isinstance(chunk, AIMessageChunk):
                     continue
@@ -1299,6 +1305,7 @@ def sidebar_panel():
         st.session_state.setdefault('pending_memories', [])
         if st.session_state.pending_memories:
             st.subheader(f"🧠 待确认记忆（{len(st.session_state.pending_memories)}）")
+            st.caption('点 ✅ 写入跨会话长期记忆（以后每个新会话都记得），点 ❌ 丢弃')
             for item in list(st.session_state.pending_memories):
                 col_fact, col_ok, col_no = st.columns([5, 1, 1])
                 col_fact.caption(item['fact'])
