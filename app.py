@@ -668,13 +668,24 @@ def submit_pending_memory(fact: str) -> str:
 # 明确的"记住某事"祈使表达：不依赖模型自觉，弱模型漏判时由规则兜底直接进待确认队列
 _MEM_PREFIX = r"(?:帮我|给我|请你?|麻烦你?|你要|一定要?|要|可得|可得要)?"
 _MEM_VERB = r"(?:记住|记一下|记一记|记下|记好|别忘了|不要忘记|别忘|记进|记入|记录一下|存一下|保存一下)"
-_MEM_TAIL = r"[了啊呀哦哈呗呐啦~。！!，,\s]*$"
+# 句尾允许再跟一个指代词："邮箱是xx@xx.com，帮我记住这个"（具体内容在同一句前缀里，照样直接提取）
+_MEM_DEIXIS = r"(?:这个|那个|这些|那些|这件事|这事儿|这事|那件事|那事儿|它)?"
+_MEM_TAIL = _MEM_DEIXIS + r"[了啊呀哦哈呗呐啦吧~。！!，,\s]*$"
 _MEM_BA_RE = re.compile(r"把(.+?)(?:给我)?" + _MEM_VERB + _MEM_TAIL)
 _MEM_PRE_RE = re.compile(_MEM_PREFIX + _MEM_VERB + r"[:：，,、\s]*(.+)$")
 _MEM_END_RE = re.compile(r"(.{3,})(?:，|,)?(?:帮我|给我)?" + _MEM_VERB + _MEM_TAIL)
 _MEM_RECALL_RE = re.compile(
     r"(我记得|我还记得|还记不记得|你记得|记不清|不记得|有没有记住|记住了吗|记没记住|还记得吗)")
-_MEM_TRIM = " ：:，,。.！!啊呀哦哈呗呐啦~～\"“”'‘’了你给帮"
+# 句尾自述："今天的课我记住了""单词我都记住了""名字我已经记住了"——不是对AI的指令
+_MEM_SELF_END_RE = re.compile(r"我(?:都|已经|早已|早就|全|全都)?$")
+_MEM_TRIM = " ：:，,。.！!啊呀哦哈呗呐啦吧~～\"“”'‘’了你给帮把将"
+
+
+def _is_pure_deixis(s: str) -> bool:
+    """纯指代（这个/这件事/把这个）没有具体事实，需要结合上文，交给模型处理。"""
+    s = s.strip(_MEM_TRIM)
+    return len(s) < 3 or bool(
+        re.fullmatch(r"(这个|那个|这些|那些|这件事|这事儿|这事|那件事|那事儿|它).*", s))
 
 
 def detect_memory_request(text: str):
@@ -685,25 +696,25 @@ def detect_memory_request(text: str):
         return None
     content = None
     m = _MEM_BA_RE.search(t)  # 把 X 记住 / 别忘了 X 把字式
-    if m:
+    if m and not _is_pure_deixis(m.group(1)):
         content = m.group(1)
-    else:
+    if content is None:
         m = _MEM_PRE_RE.search(t)  # 帮我记住 X / 记住：X
         if m:
             # "我记住了…"是自述不是指令：指令词紧挨在"我"后面时排除
             i = m.start()
             if i > 0 and t[i - 1] == "我" and not t[:i].endswith(("帮", "给")):
                 m = None
+            if m and not _is_pure_deixis(m.group(1)):
+                content = m.group(1)
+    if content is None:
+        m = _MEM_END_RE.search(t)  # X，帮我记一下 / X，帮我记住这个
         if m:
-            content = m.group(1)
-        else:
-            m = _MEM_END_RE.search(t)  # X，帮我记一下（指令在句尾）
-            if m:
-                g1 = m.group(1).rstrip(" ，,。、")
-                # 排除"这个知识点我记住了"这类自述（以"我"结尾且不是"帮我/给我"）
-                is_self_told = g1.endswith("我") and not g1.endswith(("帮我", "给我"))
-                if not is_self_told:
-                    content = g1
+            g1 = m.group(1).rstrip(" ，,。、")
+            # 排除"今天的课我记住了""单词我都记住了"这类自述（祈使"帮我/给我"除外）
+            is_self_told = bool(_MEM_SELF_END_RE.search(g1)) and not g1.endswith(("帮我", "给我"))
+            if not is_self_told and not _is_pure_deixis(g1):
+                content = g1
     if not content:
         return None
     # 去掉句尾句式残留的祈使词（"…，帮我/给我/你给我"），只处理整词避免误删正文里的字
@@ -712,8 +723,8 @@ def detect_memory_request(text: str):
             content = content[:-len(_suf)]
             break
     content = content.strip(_MEM_TRIM)
-    # 纯指代（"这个/这件事"）没有具体事实，交给模型结合上下文提取
-    if len(content) < 3 or re.fullmatch(r"(这个|那个|这些|那些|这件事|这事儿|这事|那件事).*", content):
+    if _is_pure_deixis(content):
+        # 整条只有"帮我记住这个"——事实在上文里，规则不猜，交给模型结合上下文提取
         return None
     return content[:80]
 
@@ -1352,6 +1363,49 @@ def chat_display():
 
 
 # ============================== 侧边栏（@st.fragment：fragment 内 rerun(scope='fragment') 才合法） ==============================
+@st.fragment(run_every=timedelta(seconds=2))
+def pending_memory_panel():
+    """待确认记忆是独立分片：每 2 秒轮询一次磁盘文件。
+    聊天分片里模型工具/规则兜底新提交的记忆只触发聊天分片局部刷新，侧边栏本身不会重绘；
+    跨 fragment 无法直接通信，用 pending_memories.json 当桥——这里发现磁盘有新条目就自动刷出来，
+    用户不用手动 F5，也避免整页 rerun 的灰屏。"""
+    # 本分片里点「保存/丢弃」产生的 toast 由本分片自己的通道下发（fragment rerun 不会带动侧边栏主分片）
+    render_js_channel(st.session_state.get('_js_chan_pending'))
+    st.session_state['_js_chan_pending'] = []
+
+    disk = load_pending_memories()
+    cur = st.session_state.get('pending_memories')
+    disk_ids = [p.get('id') for p in disk]
+    if cur is None or [p.get('id') for p in cur] != disk_ids:
+        st.session_state.pending_memories = disk
+        cur = disk
+    if not cur:
+        return
+    st.subheader(f"🧠 待确认记忆（{len(cur)}）")
+    st.caption('点「保存」写入跨会话长期记忆（以后每个新会话都记得），点「丢弃」删除；鼠标悬停按钮可看详细说明')
+    for item in list(cur):
+        col_fact, col_ok, col_no = st.columns([4, 1.3, 1.3])
+        col_fact.caption(item['fact'])
+        if col_ok.button('保存', key=f"mem_ok_{item['id']}", type='primary',
+                         help='确认写入：保存到跨会话长期记忆，以后每个新会话都会记得这条'):
+            memories = load_memories()
+            if not any(m['fact'] == item['fact'] for m in memories):
+                memories.append(dict(item))
+                save_memories(memories)
+            st.session_state.pending_memories = [
+                p for p in st.session_state.pending_memories if p['id'] != item['id']]
+            save_pending_memories(st.session_state.pending_memories)
+            queue_toast('已写入长期记忆', '🧠')
+            st.rerun(scope='fragment')
+        if col_no.button('丢弃', key=f"mem_no_{item['id']}",
+                         help='不保存这条：直接删除，以后任何会话都不会记得'):
+            st.session_state.pending_memories = [
+                p for p in st.session_state.pending_memories if p['id'] != item['id']]
+            save_pending_memories(st.session_state.pending_memories)
+            queue_toast('已拒绝，不会保存', '🗑️')
+            st.rerun(scope='fragment')
+
+
 @st.fragment
 def sidebar_panel():
     # 指令通道最先渲染（height=0 不占位）：toast/新建会话清场的 delta 第一批下发，
@@ -1441,32 +1495,9 @@ def sidebar_panel():
         # 性格：同样 keyed，失焦提交后下一次发消息立即按新人设构建 agent
         st.text_area('性格', placeholder="请输入性格（点外面失焦生效）", key='nature')
 
-        # ---- 待确认记忆（Human-in-the-Loop：写入长期记忆前由用户把关） ----
+        # ---- 待确认记忆（独立分片：2 秒轮询磁盘，模型/规则提交后卡片自动冒出来，无需 F5） ----
         st.session_state.setdefault('pending_memories', [])
-        if st.session_state.pending_memories:
-            st.subheader(f"🧠 待确认记忆（{len(st.session_state.pending_memories)}）")
-            st.caption('点「保存」写入跨会话长期记忆（以后每个新会话都记得），点「丢弃」删除；鼠标悬停按钮可看详细说明')
-            for item in list(st.session_state.pending_memories):
-                col_fact, col_ok, col_no = st.columns([4, 1.3, 1.3])
-                col_fact.caption(item['fact'])
-                if col_ok.button('保存', key=f"mem_ok_{item['id']}", type='primary',
-                                 help='确认写入：保存到跨会话长期记忆，以后每个新会话都会记得这条'):
-                    memories = load_memories()
-                    if not any(m['fact'] == item['fact'] for m in memories):
-                        memories.append(dict(item))
-                        save_memories(memories)
-                    st.session_state.pending_memories = [
-                        p for p in st.session_state.pending_memories if p['id'] != item['id']]
-                    save_pending_memories(st.session_state.pending_memories)
-                    queue_toast('已写入长期记忆', '🧠')
-                    st.rerun(scope='fragment')
-                if col_no.button('丢弃', key=f"mem_no_{item['id']}",
-                                 help='不保存这条：直接删除，以后任何会话都不会记得'):
-                    st.session_state.pending_memories = [
-                        p for p in st.session_state.pending_memories if p['id'] != item['id']]
-                    save_pending_memories(st.session_state.pending_memories)
-                    queue_toast('已拒绝，不会保存', '🗑️')
-                    st.rerun(scope='fragment')
+        pending_memory_panel()
 
         # ---- 心情晴雨表（结构化输出情感分析） ----
         st.subheader('💗 心情晴雨表')
