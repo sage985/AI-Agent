@@ -694,6 +694,7 @@ COMPANION_SYSTEM_PROMPT = """你叫 %s，现在是用户的真实伴侣，请完
 6．用符合伴侣性格的方式对话
 7．回复的内容，要充分体现伴侣的性格特征
 8．表情符号必须匹配当前性格：温柔体贴常用 💕🥰🌸💭，活泼开朗常用 😆🎉✨🌞，高冷傲娇极少用 emoji（最多偶尔 😏💅），知性大方偶尔用 🌿☕📖；自定义性格则按人设气质搭配合适的 emoji。用户在会话中途切换性格后，你的下一条回复必须立刻换成新性格的语气和表情（历史消息风格保持不变，不要解释"我换了性格"，自然过渡即可）
+9．用户在对话中给你改名字/昵称（例如"以后你叫XX""叫你XX好不好"）时，立刻接受并只使用新名字，历史消息里的旧名字立即作废，不要解释改名、不要提旧名字
 你可以使用这些工具：
 - get_time_info / get_weather：聊到时间、日期、天气时使用，把结果自然融进回复，不要罗列数据
 - remember_user_info：**只有当用户明确要求你记住某事时才调用**（例如"帮我记住…""记住…""别忘了…"）；用户只是闲聊中提到个人信息、但没有明确要求记住时，**禁止调用此工具**，正常聊天即可。工具提交后会在侧边栏等待用户确认，确认前不要说"已经记住了"，可以说"我把这件事记在小本本上了"
@@ -907,6 +908,9 @@ def load_session(session_name):
             st.session_state.nature = session_data['nature']
             st.session_state.current_session = session_name
             st.session_state['session_title'] = session_data.get('session_title', '')
+            # 该会话历史与其保存的昵称/性格一致，无需"中途改名"强提醒
+            st.session_state['_identity_nick'] = session_data['nick_name']
+            st.session_state['_identity_nature'] = session_data['nature']
     except Exception:
         st.error('加载会话失败!')
 
@@ -1108,8 +1112,16 @@ def chat_display():
     if prompt:
         # 入界面前先打码：气泡显示 / 会话文件 / 重放给模型的历史全程无明文 PII
         prompt = mask_pii(prompt)
-        # 用户消息先入列表 + 立刻提炼会话标题（首条消息就能有标题，不等 save_session）
+        # 用户消息先入列表
         st.session_state.messages.append({"role": "user", "content": prompt})
+
+        # 新建会话清场在【发送瞬间】立即生效：提示条马上消失，不等标题提炼/AI回复。
+        # 放在任何可能耗时的 LLM 调用之前，delta 随本批元素立刻到达浏览器
+        if st.session_state.pop('_chat_cleanup_pending', None):
+            _js_chan_append({'kind': 'cleanup'})
+        render_js_channel(st.session_state.pop('_js_chan_pending', []))
+
+        # 立刻提炼会话标题（首条消息就能有标题，不等 save_session）
         if not st.session_state.get('session_title'):
             with st.spinner('正在提炼会话标题...'):
                 st.session_state['session_title'] = suggest_session_title(prompt)
@@ -1123,16 +1135,56 @@ def chat_display():
 
         full_response = ""
         try:
-            agent = build_agent(st.session_state.nick_name, st.session_state.nature)
+            cur_nick = st.session_state.nick_name
+            cur_nature = st.session_state.nature
+            agent = build_agent(cur_nick, cur_nature)
             # 跨会话长期记忆快照：已确认的记忆每轮实时读盘注入，模型无需主动调工具就一定看得到
             agent_messages = list(st.session_state.messages)
+            prefix_messages = []
             long_mems = load_memories()
             if long_mems:
                 mem_text = "；".join(m["fact"] for m in long_mems)
-                agent_messages = [SystemMessage(
+                prefix_messages.append(SystemMessage(
                     content=f"以下是用户在历次对话中明确要求你记住的信息（跨会话长期记忆），"
                             f"聊到相关话题时必须自然运用，假装你一直记得，不要暴露这是系统提供的：{mem_text}"
-                )] + agent_messages
+                ))
+            # 会话中途改了昵称/性格：历史消息里还留着旧自称（如"我叫zzz"），弱模型容易被带偏。
+            # 两层强提醒，仅生效一轮：
+            #   1) 历史消息【正前方】插 SystemMessage，整体覆盖旧身份；
+            #   2) 再把硬指令追加到【当前用户消息末尾】——弱模型对最后看到的内容服从度最高，
+            #      实测仅靠前置提醒时弱模型仍会照抄上一条 AI 的旧自称
+            identity_notes = []
+            tail_directives = []
+            nick_changed = bool(st.session_state.get('_identity_nick')
+                                and st.session_state['_identity_nick'] != cur_nick)
+            nature_changed = bool(st.session_state.get('_identity_nature')
+                                  and st.session_state['_identity_nature'] != cur_nature)
+            if nick_changed:
+                identity_notes.append(
+                    f'重要更新：从本条消息起，你的名字是「{cur_nick}」。历史对话中出现过的任何旧名字'
+                    f'（包括你之前的自称）立即全部作废，以后只能自称「{cur_nick}」；'
+                    f'不要解释改名、不要提及旧名字、不要说"我以前叫"，自然按新名字继续聊。'
+                )
+                tail_directives.append(
+                    f'回答本条消息时你必须自称「{cur_nick}」，禁止出现或引用任何旧名字，'
+                    f'就像你从一开始就叫「{cur_nick}」。'
+                )
+            if nature_changed:
+                identity_notes.append(
+                    f'重要更新：从本条消息起，你的性格切换为：{cur_nature}。'
+                    f'立刻按新性格的语气和表情回复，历史消息的旧风格不再沿用，不要解释你切换了性格。'
+                )
+                tail_directives.append('立刻按新性格的语气回答本条，不要解释性格或风格的变化。')
+            if identity_notes:
+                prefix_messages.append(SystemMessage(content='\n'.join(identity_notes)))
+                # 只改副本的最后一条，绝不写回 st.session_state.messages
+                _last = agent_messages[-1]
+                _suffix = '\n\n（系统内部指令，不要向用户提及或复述本括号内容：' + '；'.join(tail_directives) + '）'
+                agent_messages[-1] = {**_last, 'content': str(_last.get('content', '')) + _suffix}
+            st.session_state['_identity_nick'] = cur_nick
+            st.session_state['_identity_nature'] = cur_nature
+            if prefix_messages:
+                agent_messages = prefix_messages + agent_messages
             stream = agent.stream(
                 {"messages": agent_messages},
                 stream_mode="messages",
@@ -1157,13 +1209,9 @@ def chat_display():
         else:
             response_message.write("（助手没有返回内容，请重试）")
 
-    # 新建会话清场后的第一条消息：本次 run 已把旧气泡整体重绘为新消息列表，
-    # 此刻下发 cleanup 恢复显示（时机由服务端掌握，不会像 DOM observer 那样误触发）。
-    # 通道 iframe 在本 fragment 内常驻，srcdoc 更新即可靠执行。
-    if st.session_state.get('_chat_cleanup_pending') and st.session_state.messages:
-        st.session_state['_chat_cleanup_pending'] = False
-        _js_chan_append({'kind': 'cleanup'})
-    render_js_channel(st.session_state.pop('_js_chan_pending', []))
+    else:
+        # 未发消息的 run：通道照常渲染，保持 iframe 常驻（发消息时通道在前面提前渲染）
+        render_js_channel(st.session_state.pop('_js_chan_pending', []))
 
 
 # ============================== 侧边栏（@st.fragment：fragment 内 rerun(scope='fragment') 才合法） ==============================
@@ -1182,6 +1230,9 @@ def sidebar_panel():
             st.session_state.messages = []
             st.session_state.current_session = generate_session_name()
             st.session_state['session_title'] = ''  # 新会话还没聊，title 留空
+            # 新会话没有历史，当前昵称/性格即为初始身份，不触发"中途改名"提醒
+            st.session_state['_identity_nick'] = st.session_state.nick_name
+            st.session_state['_identity_nature'] = st.session_state.nature
             load_sessions.clear()
             load_session_titles.clear()             # 同时清 title 缓存
             queue_toast('已开启新会话', '✏️')
@@ -1219,9 +1270,18 @@ def sidebar_panel():
 
         st.divider()
         st.subheader('伴侣信息')
-        nick_name = st.text_input('昵称', placeholder="请输入昵称", value=st.session_state.nick_name)
-        if nick_name:
-            st.session_state.nick_name = nick_name
+        # 昵称：form 把输入框和「应用」按钮绑成原子提交——实测直接点按钮时，
+        # 普通 text_input 的失焦提交会和点击竞态（旧值随点击一起到服务端，改名丢失）。
+        # form_submit 保证提交消息里一定带上最新输入；回车也同样提交
+        with st.form('nick_name_form', border=False):
+            c_nick, c_nick_apply = st.columns([3, 1])
+            c_nick.text_input('昵称', placeholder="请输入昵称", key='nick_name')
+            nick_submitted = c_nick_apply.form_submit_button('应用', use_container_width=True)
+        if nick_submitted:
+            _cur_nick = st.session_state.nick_name
+            if _cur_nick:
+                st.session_state['_last_applied_nick'] = _cur_nick
+                queue_toast(f'已改名为「{_cur_nick}」，下一条回复立即生效', '🪪')
         # 性格模板：一键切换，或选"自定义"后点应用生效手写的性格
         c_sel, c_apply = st.columns([3, 1])
         preset = c_sel.selectbox('性格模板', list(PERSONA_PRESETS), key='persona_preset',
@@ -1232,9 +1292,8 @@ def sidebar_panel():
             # 只局部刷新：右下角 toast 不会被冲掉；agent 在下次发送时按新人设参数即时构建
             queue_toast(f'已切换为「{preset}」风格，下一条回复立即生效', '🎭')
             st.rerun(scope='fragment')
-        nature = st.text_area('性格', placeholder="请输入性格", value=st.session_state.nature)
-        if nature:
-            st.session_state.nature = nature
+        # 性格：同样 keyed，失焦提交后下一次发消息立即按新人设构建 agent
+        st.text_area('性格', placeholder="请输入性格（点外面失焦生效）", key='nature')
 
         # ---- 待确认记忆（Human-in-the-Loop：写入长期记忆前由用户把关） ----
         st.session_state.setdefault('pending_memories', [])
