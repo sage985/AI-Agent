@@ -1362,52 +1362,55 @@ def chat_display():
         render_js_channel(st.session_state.pop('_js_chan_pending', []))
 
 
-# ============================== 侧边栏（@st.fragment：fragment 内 rerun(scope='fragment') 才合法） ==============================
+# ============================== 侧边栏（三个平级顶层 fragment，禁止相互嵌套——
+# 嵌套 @st.fragment 在 run_every 自动重跑时会与父分片的 delta 树撞车，
+# 前端报 "Bad delta path index" 直接白屏；平级分片各占独立子树才安全） ==============================
 @st.fragment(run_every=timedelta(seconds=2))
 def pending_memory_panel():
-    """待确认记忆是独立分片：每 2 秒轮询一次磁盘文件。
-    聊天分片里模型工具/规则兜底新提交的记忆只触发聊天分片局部刷新，侧边栏本身不会重绘；
+    """待确认记忆分片（侧边栏中段）：每 2 秒轮询一次磁盘文件。
+    聊天分片里模型工具/规则兜底新提交的记忆只触发聊天分片局部刷新，侧边栏不会重绘；
     跨 fragment 无法直接通信，用 pending_memories.json 当桥——这里发现磁盘有新条目就自动刷出来，
     用户不用手动 F5，也避免整页 rerun 的灰屏。"""
-    # 本分片里点「保存/丢弃」产生的 toast 由本分片自己的通道下发（fragment rerun 不会带动侧边栏主分片）
-    render_js_channel(st.session_state.get('_js_chan_pending'))
-    st.session_state['_js_chan_pending'] = []
+    with st.sidebar:
+        # 本分片里点「保存/丢弃」产生的 toast 由本分片自己的通道下发（fragment rerun 不带动其他分片）
+        render_js_channel(st.session_state.get('_js_chan_pending'))
+        st.session_state['_js_chan_pending'] = []
 
-    disk = load_pending_memories()
-    cur = st.session_state.get('pending_memories')
-    disk_ids = [p.get('id') for p in disk]
-    if cur is None or [p.get('id') for p in cur] != disk_ids:
-        st.session_state.pending_memories = disk
-        cur = disk
-    if not cur:
-        return
-    st.subheader(f"🧠 待确认记忆（{len(cur)}）")
-    st.caption('点「保存」写入跨会话长期记忆（以后每个新会话都记得），点「丢弃」删除；鼠标悬停按钮可看详细说明')
-    for item in list(cur):
-        col_fact, col_ok, col_no = st.columns([4, 1.3, 1.3])
-        col_fact.caption(item['fact'])
-        if col_ok.button('保存', key=f"mem_ok_{item['id']}", type='primary',
-                         help='确认写入：保存到跨会话长期记忆，以后每个新会话都会记得这条'):
-            memories = load_memories()
-            if not any(m['fact'] == item['fact'] for m in memories):
-                memories.append(dict(item))
-                save_memories(memories)
-            st.session_state.pending_memories = [
-                p for p in st.session_state.pending_memories if p['id'] != item['id']]
-            save_pending_memories(st.session_state.pending_memories)
-            queue_toast('已写入长期记忆', '🧠')
-            st.rerun(scope='fragment')
-        if col_no.button('丢弃', key=f"mem_no_{item['id']}",
-                         help='不保存这条：直接删除，以后任何会话都不会记得'):
-            st.session_state.pending_memories = [
-                p for p in st.session_state.pending_memories if p['id'] != item['id']]
-            save_pending_memories(st.session_state.pending_memories)
-            queue_toast('已拒绝，不会保存', '🗑️')
-            st.rerun(scope='fragment')
+        disk = load_pending_memories()
+        cur = st.session_state.get('pending_memories')
+        disk_ids = [p.get('id') for p in disk]
+        if cur is None or [p.get('id') for p in cur] != disk_ids:
+            st.session_state.pending_memories = disk
+            cur = disk
+        if not cur:
+            return
+        st.subheader(f"🧠 待确认记忆（{len(cur)}）")
+        st.caption('点「保存」写入跨会话长期记忆（以后每个新会话都记得），点「丢弃」删除；鼠标悬停按钮可看详细说明')
+        for item in list(cur):
+            col_fact, col_ok, col_no = st.columns([4, 1.3, 1.3])
+            col_fact.caption(item['fact'])
+            if col_ok.button('保存', key=f"mem_ok_{item['id']}", type='primary',
+                             help='确认写入：保存到跨会话长期记忆，以后每个新会话都会记得这条'):
+                memories = load_memories()
+                if not any(m['fact'] == item['fact'] for m in memories):
+                    memories.append(dict(item))
+                    save_memories(memories)
+                st.session_state.pending_memories = [
+                    p for p in st.session_state.pending_memories if p['id'] != item['id']]
+                save_pending_memories(st.session_state.pending_memories)
+                queue_toast('已写入长期记忆', '🧠')
+                st.rerun(scope='fragment')
+            if col_no.button('丢弃', key=f"mem_no_{item['id']}",
+                             help='不保存这条：直接删除，以后任何会话都不会记得'):
+                st.session_state.pending_memories = [
+                    p for p in st.session_state.pending_memories if p['id'] != item['id']]
+                save_pending_memories(st.session_state.pending_memories)
+                queue_toast('已拒绝，不会保存', '🗑️')
+                st.rerun(scope='fragment')
 
 
 @st.fragment
-def sidebar_panel():
+def sidebar_top():
     # 指令通道最先渲染（height=0 不占位）：toast/新建会话清场的 delta 第一批下发，
     # 不受下方 Milvus 行数等慢查询阻塞，遮罩即时出现
     render_js_channel(st.session_state.get('_js_chan_pending'))
@@ -1495,10 +1498,11 @@ def sidebar_panel():
         # 性格：同样 keyed，失焦提交后下一次发消息立即按新人设构建 agent
         st.text_area('性格', placeholder="请输入性格（点外面失焦生效）", key='nature')
 
-        # ---- 待确认记忆（独立分片：2 秒轮询磁盘，模型/规则提交后卡片自动冒出来，无需 F5） ----
-        st.session_state.setdefault('pending_memories', [])
-        pending_memory_panel()
 
+@st.fragment
+def sidebar_bottom():
+    """侧边栏下半区：心情晴雨表 + Milvus 状态 + 版本脚注。与上半区/待确认记忆平级，互不嵌套。"""
+    with st.sidebar:
         # ---- 心情晴雨表（结构化输出情感分析） ----
         st.subheader('💗 心情晴雨表')
         if st.button('生成心情报告', width='stretch', icon='✨'):
@@ -1564,6 +1568,8 @@ _cur_title = st.session_state.get('session_title') or '主对话'
 _cur_ts = st.session_state.get('current_session', '')
 st.caption(f"🎯 {_cur_title}  ·  会话文件: {_cur_ts}")
 
-sidebar_panel()  # 侧边栏（@st.fragment 保护：删除/切换等操作只局部刷新不灰屏）
+sidebar_top()            # 侧边栏上半（控制面板/会话历史/伴侣信息）
+pending_memory_panel()    # 侧边栏中段（待确认记忆，2 秒轮询）——平级分片，不可嵌进上两个
+sidebar_bottom()         # 侧边栏下半（心情晴雨表/Milvus/脚注）
 chat_display()   # 聊天区 fragment（含 chat_input，发送消息只局部刷新不灰屏）
 js_reset_chat_guard()  # 整页加载/整页 rerun 时兜底清除新建会话的临时遮罩
