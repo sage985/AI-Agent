@@ -208,6 +208,15 @@ _JS_CHANNEL_TAIL = """
     var w0 = doc.getElementById('__new_chat_welcome__');
     if (w0) w0.remove();
   }
+  // 切换/加载已有会话：遮罩 class 和欢迎条是 JS 挂在 body 上的外来状态，
+  // st.rerun() 的 React 重渲染不会清它们，必须显式移除，否则旧会话消息被 CSS 隐藏成空白
+  function restoreChat(c){
+    cleanupChat();
+    var doc = win.document;
+    // caption 曾被 clearChat 用 JS 直接改过文本，React 认为"没变"不会改回，这里手动同步
+    var caps = doc.querySelectorAll("[data-testid='stMain'] [data-testid='stCaptionContainer']");
+    if (caps.length) caps[caps.length-1].textContent = '🎯 ' + c.title + '  ·  会话文件: ' + c.name;
+  }
   for (var i=0;i<cmds.length;i++){
     var c = cmds[i];
     if (!c || win.__jsCmdDone[c.id]) continue;
@@ -216,6 +225,7 @@ _JS_CHANNEL_TAIL = """
       if (c.kind === 'toast') showToast(c);
       else if (c.kind === 'clear') clearChat(c);
       else if (c.kind === 'cleanup') cleanupChat();
+      else if (c.kind === 'restore') restoreChat(c);
     } catch(e) {}
   }
 })();
@@ -240,6 +250,11 @@ def queue_clear_chat(session_name: str, title: str = "主对话"):
     同时挂起 cleanup：等 chat_display 在清场后第一条消息的那次 run 里下发，恢复气泡显示"""
     _js_chan_append({'kind': 'clear', 'name': str(session_name), 'title': str(title)})
     st.session_state['_chat_cleanup_pending'] = True
+
+
+def queue_restore_chat(session_name: str, title: str = "主对话"):
+    """切换/加载已有会话时下发：移除新建会话遮罩与欢迎条、同步 caption，保证旧会话正常可见"""
+    _js_chan_append({'kind': 'restore', 'name': str(session_name), 'title': str(title)})
 
 
 def render_js_channel(cmds):
@@ -1232,6 +1247,7 @@ def sidebar_panel():
         st.subheader('AI控制面板')
 
         if st.button('新建会话', width='stretch', icon='✏️'):
+            # ① 先把当前会话原样落盘——旧会话文件此后不再被写，绝不被覆盖
             save_session()
             st.session_state.messages = []
             st.session_state.current_session = generate_session_name()
@@ -1239,6 +1255,8 @@ def sidebar_panel():
             # 新会话没有历史，当前昵称/性格即为初始身份，不触发"中途改名"提醒
             st.session_state['_identity_nick'] = st.session_state.nick_name
             st.session_state['_identity_nature'] = st.session_state.nature
+            # ② 立刻为新会话创建独立空文件并出现在历史列表（自动保存，不等第一条消息）
+            save_session()
             load_sessions.clear()
             load_session_titles.clear()             # 同时清 title 缓存
             queue_toast('已开启新会话', '✏️')
@@ -1260,7 +1278,11 @@ def sidebar_panel():
                              key=f'load_{session}',
                              type='primary' if session == st.session_state.current_session else 'secondary'):
                     load_session(session)
+                    load_sessions.clear()
                     load_session_titles.clear()  # 清 title 缓存让下一轮取新值
+                    # 移除新建会话遮罩/欢迎条并同步标题，否则旧会话消息渲染了也被 CSS 隐藏
+                    queue_restore_chat(session,
+                                       st.session_state.get('session_title') or '主对话')
                     st.rerun()
             with col2:
                 if st.button('', width='stretch', icon='❌️', key=f'delete_{session}',
@@ -1270,6 +1292,8 @@ def sidebar_panel():
                     load_sessions.clear()
                     load_session_titles.clear()  # 删会话也清 title 缓存
                     if is_current:
+                        # 删除的是当前会话：delete_session 已生成新空会话，同样移除遮罩/欢迎条
+                        queue_restore_chat(st.session_state.current_session, '主对话')
                         st.rerun()
                     else:
                         st.rerun(scope="fragment")
