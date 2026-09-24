@@ -1227,7 +1227,7 @@ def chat_display():
                     if chunk.name == "search_love_knowledge":
                         custom_toast("已检索恋爱知识库", icon="🔍")
                     elif chunk.name == "remember_user_info":
-                        custom_toast("有条新记忆等确认：侧边栏「🧠 待确认记忆」点 ✅ 后长期生效",
+                        custom_toast("有条新记忆等确认：侧边栏「🧠 待确认记忆」点「保存」后长期生效",
                                      icon="🧠", duration_ms=4000)
                     continue
                 if not isinstance(chunk, AIMessageChunk):
@@ -1345,11 +1345,12 @@ def sidebar_panel():
         st.session_state.setdefault('pending_memories', [])
         if st.session_state.pending_memories:
             st.subheader(f"🧠 待确认记忆（{len(st.session_state.pending_memories)}）")
-            st.caption('点 ✅ 写入跨会话长期记忆（以后每个新会话都记得），点 ❌ 丢弃')
+            st.caption('点「保存」写入跨会话长期记忆（以后每个新会话都记得），点「丢弃」删除；鼠标悬停按钮可看详细说明')
             for item in list(st.session_state.pending_memories):
-                col_fact, col_ok, col_no = st.columns([5, 1, 1])
+                col_fact, col_ok, col_no = st.columns([4, 1.3, 1.3])
                 col_fact.caption(item['fact'])
-                if col_ok.button('✅', key=f"mem_ok_{item['id']}", help='确认写入长期记忆'):
+                if col_ok.button('保存', key=f"mem_ok_{item['id']}", type='primary',
+                                 help='确认写入：保存到跨会话长期记忆，以后每个新会话都会记得这条'):
                     memories = load_memories()
                     if not any(m['fact'] == item['fact'] for m in memories):
                         memories.append(dict(item))
@@ -1359,7 +1360,8 @@ def sidebar_panel():
                     save_pending_memories(st.session_state.pending_memories)
                     queue_toast('已写入长期记忆', '🧠')
                     st.rerun(scope='fragment')
-                if col_no.button('❌', key=f"mem_no_{item['id']}", help='不保存这条'):
+                if col_no.button('丢弃', key=f"mem_no_{item['id']}",
+                                 help='不保存这条：直接删除，以后任何会话都不会记得'):
                     st.session_state.pending_memories = [
                         p for p in st.session_state.pending_memories if p['id'] != item['id']]
                     save_pending_memories(st.session_state.pending_memories)
