@@ -637,28 +637,105 @@ def get_weather(city: str) -> str:
         return f"天气服务暂不可用（{e.__class__.__name__}），暂无 {city} 的天气数据"
 
 
-@tool
-def remember_user_info(fact: str) -> str:
-    """把关于用户的重要信息提交到待确认队列（生日、喜好、纪念日、工作、心愿等）。
-    用户在侧边栏点确认后才会真正写入长期记忆（Human-in-the-Loop，对应 chapter07-09 思路）
+def _jaccard(a: set, b: set) -> float:
+    return len(a & b) / len(a | b) if (a or b) else 0.0
 
-    Args:
-        fact (str): 要记住的一条信息，一句话描述，例如 "用户的生日是5月20日"
-    """
-    fact = fact.strip()
-    # 去重：已确认的长期记忆和待确认队列里都不能重复
-    if any(m["fact"] == fact for m in load_memories()):
-        return f"这条已经记过了：{fact}"
+
+def submit_pending_memory(fact: str) -> str:
+    """待确认记忆的唯一入口（模型工具调用与规则兜底共用）。
+    精确 + 语义近似(bigram Jaccard≥0.6)双重去重，避免模型与规则对同一件事各提一条。
+    返回 added / exists_long / exists_pending / empty。"""
+    fact = re.sub(r"\s+", "", str(fact).strip())[:80]
+    if not fact:
+        return "empty"
+    grams = _bigrams(fact)
+    if any(m["fact"] == fact or _jaccard(grams, _bigrams(m["fact"])) >= 0.6
+           for m in load_memories()):
+        return "exists_long"
     pending = st.session_state.setdefault("pending_memories", [])
-    if any(p["fact"] == fact for p in pending):
-        return f"这条正在等待用户确认：{fact}"
+    if any(p["fact"] == fact or _jaccard(grams, _bigrams(p["fact"])) >= 0.6
+           for p in pending):
+        return "exists_pending"
     pending.append({
         "id": uuid.uuid4().hex[:8],
         "fact": fact,
         "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
     })
     save_pending_memories(pending)  # 落盘：刷新/重启后待确认卡片不丢
-    return f"已提交待确认：{fact}（用户在侧边栏点✅后才会写入长期记忆）"
+    return "added"
+
+
+# 明确的"记住某事"祈使表达：不依赖模型自觉，弱模型漏判时由规则兜底直接进待确认队列
+_MEM_PREFIX = r"(?:帮我|给我|请你?|麻烦你?|你要|一定要?|要|可得|可得要)?"
+_MEM_VERB = r"(?:记住|记一下|记一记|记下|记好|别忘了|不要忘记|别忘|记进|记入|记录一下|存一下|保存一下)"
+_MEM_TAIL = r"[了啊呀哦哈呗呐啦~。！!，,\s]*$"
+_MEM_BA_RE = re.compile(r"把(.+?)(?:给我)?" + _MEM_VERB + _MEM_TAIL)
+_MEM_PRE_RE = re.compile(_MEM_PREFIX + _MEM_VERB + r"[:：，,、\s]*(.+)$")
+_MEM_END_RE = re.compile(r"(.{3,})(?:，|,)?(?:帮我|给我)?" + _MEM_VERB + _MEM_TAIL)
+_MEM_RECALL_RE = re.compile(
+    r"(我记得|我还记得|还记不记得|你记得|记不清|不记得|有没有记住|记住了吗|记没记住|还记得吗)")
+_MEM_TRIM = " ：:，,。.！!啊呀哦哈呗呐啦~～\"“”'‘’了你给帮"
+
+
+def detect_memory_request(text: str):
+    """从用户原话中识别"把 X 记入长期记忆"的明确指令并提取 X；非指令返回 None。
+    任何内容都支持（手机号、邮箱、喜好、生日、纪念日、地址……），不限于 PII。"""
+    t = str(text).strip()
+    if len(t) < 3 or "?" in t or "？" in t or _MEM_RECALL_RE.search(t):
+        return None
+    content = None
+    m = _MEM_BA_RE.search(t)  # 把 X 记住 / 别忘了 X 把字式
+    if m:
+        content = m.group(1)
+    else:
+        m = _MEM_PRE_RE.search(t)  # 帮我记住 X / 记住：X
+        if m:
+            # "我记住了…"是自述不是指令：指令词紧挨在"我"后面时排除
+            i = m.start()
+            if i > 0 and t[i - 1] == "我" and not t[:i].endswith(("帮", "给")):
+                m = None
+        if m:
+            content = m.group(1)
+        else:
+            m = _MEM_END_RE.search(t)  # X，帮我记一下（指令在句尾）
+            if m:
+                g1 = m.group(1).rstrip(" ，,。、")
+                # 排除"这个知识点我记住了"这类自述（以"我"结尾且不是"帮我/给我"）
+                is_self_told = g1.endswith("我") and not g1.endswith(("帮我", "给我"))
+                if not is_self_told:
+                    content = g1
+    if not content:
+        return None
+    # 去掉句尾句式残留的祈使词（"…，帮我/给我/你给我"），只处理整词避免误删正文里的字
+    for _suf in ("你给我", "帮我", "给我"):
+        if content.endswith(_suf):
+            content = content[:-len(_suf)]
+            break
+    content = content.strip(_MEM_TRIM)
+    # 纯指代（"这个/这件事"）没有具体事实，交给模型结合上下文提取
+    if len(content) < 3 or re.fullmatch(r"(这个|那个|这些|那些|这件事|这事儿|这事|那件事).*", content):
+        return None
+    return content[:80]
+
+
+@tool
+def remember_user_info(fact: str) -> str:
+    """把关于用户的重要信息提交到待确认队列（生日、喜好、纪念日、工作、联系方式、心愿、
+    家人朋友、重要约定等，任何内容都可以，不限于手机号/邮箱）。
+    用户在侧边栏点确认后才会真正写入长期记忆（Human-in-the-Loop，对应 chapter07-09 思路）
+
+    Args:
+        fact (str): 要记住的一条信息，一句话描述，例如 "用户的生日是5月20日"
+    """
+    status = submit_pending_memory(fact)
+    fact = re.sub(r"\s+", "", str(fact).strip())[:80]
+    if status == "exists_long":
+        return f"这条已经记过了：{fact}"
+    if status == "exists_pending":
+        return f"这条正在等待用户确认：{fact}"
+    if status == "empty":
+        return "没有提取到要记住的具体内容，请给出事实本身。"
+    return f"已提交待确认：{fact}（用户在侧边栏点「保存」后才会写入长期记忆）"
 
 
 @tool
@@ -728,7 +805,7 @@ COMPANION_SYSTEM_PROMPT = """你叫 %s，现在是用户的真实伴侣，请完
 9．用户在对话中给你改名字/昵称（例如"以后你叫XX""叫你XX好不好"）时，立刻接受并只使用新名字，历史消息里的旧名字立即作废，不要解释改名、不要提旧名字
 你可以使用这些工具：
 - get_time_info / get_weather：聊到时间、日期、天气时使用，把结果自然融进回复，不要罗列数据
-- remember_user_info：**只有当用户明确要求你记住某事时才调用**（例如"帮我记住…""记住…""别忘了…"）；用户只是闲聊中提到个人信息、但没有明确要求记住时，**禁止调用此工具**，正常聊天即可。工具提交后会在侧边栏等待用户确认，确认前不要说"已经记住了"，可以说"我把这件事记在小本本上了"
+- remember_user_info：**只有当用户明确要求你记住某事时才调用**（例如"帮我记住…""记住…""别忘了…"），内容不限——喜好、生日、纪念日、联系方式、地址、工作、心愿、家人朋友、约定等任何事实都可以，不只是手机号；用户只是闲聊中提到个人信息、但没有明确要求记住时，**禁止调用此工具**，正常聊天即可。若系统消息已提示"已自动提交到待确认队列"，**严禁重复调用**。工具提交后会在侧边栏等待用户确认，确认前不要说"已经记住了"，可以说"我把这件事记在小本本上了"
 - recall_user_info：聊到用户过去提过的事情时，先调用 recall_user_info 检索记忆再回复，禁止凭空编造
 - search_love_knowledge：当用户表达情绪或情感需求（难过、累、加班、被骂、压力大、抱怨、吵架、冷战、生病、吃醋、撒娇、求安慰、求哄、聊纪念日）时，**必须先调用 search_love_knowledge 检索，再结合检索到的参考内容回复，禁止不检索直接安慰**；只是分享开心事或问事实问题时不用调用
 工具返回的信息要用你自己的语气说出来，不要暴露工具名称。
@@ -1146,6 +1223,27 @@ def chat_display():
         # 用户消息先入列表
         st.session_state.messages.append({"role": "user", "content": prompt})
 
+        # 规则兜底：用户明确说"记住 X / 别忘了 X / 把 X 记一下"时，无论什么内容都直接
+        # 进入待确认队列，不依赖模型自主调工具（弱模型漏判也不丢）。任何事实都支持。
+        auto_mem_note = None
+        auto_fact = detect_memory_request(prompt)
+        if auto_fact:
+            _mem_status = submit_pending_memory(auto_fact)
+            if _mem_status == "added":
+                queue_toast(f'已捕捉记忆指令：{auto_fact[:16]}，侧边栏「保存」后长期生效',
+                            '🧠', 4200)
+                auto_mem_note = (
+                    f'用户本条消息明确要求记住「{auto_fact}」，系统已自动提交到待确认队列，'
+                    f'你【严禁】再调用 remember_user_info（会重复）；自然回复一句已记下、'
+                    f'提醒用户在侧边栏点「保存」即可。'
+                )
+            elif _mem_status == "exists_pending":
+                auto_mem_note = (
+                    f'「{auto_fact}」已在待确认队列中，不要重复调用 remember_user_info，'
+                    f'提醒用户去侧边栏点「保存」即可。'
+                )
+            # exists_long：早已记住，无需特别指令，模型会通过长期记忆注入自然回答
+
         # 新建会话清场在【发送瞬间】立即生效：提示条马上消失，不等标题提炼/AI回复。
         # 放在任何可能耗时的 LLM 调用之前，delta 随本批元素立刻到达浏览器
         if st.session_state.pop('_chat_cleanup_pending', None):
@@ -1172,6 +1270,8 @@ def chat_display():
             # 跨会话长期记忆快照：已确认的记忆每轮实时读盘注入，模型无需主动调工具就一定看得到
             agent_messages = list(st.session_state.messages)
             prefix_messages = []
+            if auto_mem_note:
+                prefix_messages.append(SystemMessage(content=auto_mem_note))
             long_mems = load_memories()
             if long_mems:
                 mem_text = "；".join(m["fact"] for m in long_mems)
