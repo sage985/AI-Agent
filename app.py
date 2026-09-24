@@ -200,18 +200,30 @@ _JS_CHANNEL_TAIL = """
     var cap = doc.querySelector("[data-testid='stMain'] [data-testid='stCaptionContainer']");
     if (cap) cap.textContent = '🎯 ' + c.title + '  ·  会话文件: ' + c.name;
   }
-  // 清场时机由服务端掌握：chat_display fragment 在"清场后第一条消息"那次 run 末尾下发
-  // cleanup（此时 React 已把旧气泡替换成新消息，绝不误删）。不用 DOM MutationObserver 猜测。
-  function cleanupChat(){
+  // 清场时机由服务端掌握：chat_display fragment 在"清场后第一条消息"那次 run 里下发 cleanup。
+  // 注意：该指令在 run 中途就到达，而 React 要等 fragment run 结束才卸载旧气泡 DOM——
+  // 若立刻移除 class，旧会话气泡会闪现。这里先记录当前气泡节点，轮询到它们全部被 React
+  // 卸载（新内容已提交）后再解除隐藏；waitForSwap=false 用于整页 rerun 后的立即恢复。
+  function cleanupChat(waitForSwap){
     var doc = win.document;
-    doc.body.classList.remove('__chat_cleared__');
-    var w0 = doc.getElementById('__new_chat_welcome__');
-    if (w0) w0.remove();
+    function finish(){
+      doc.body.classList.remove('__chat_cleared__');
+      var w0 = doc.getElementById('__new_chat_welcome__');
+      if (w0) w0.remove();
+    }
+    var oldNodes = Array.prototype.slice.call(
+      doc.querySelectorAll("[data-testid='stMain'] [data-testid='stChatMessage']"));
+    if (waitForSwap === false || !oldNodes.length) { finish(); return; }
+    var started = Date.now();
+    var timer = setInterval(function(){
+      var swapped = oldNodes.every(function(n){ return !n.isConnected; });
+      if (swapped || Date.now() - started > 8000) { clearInterval(timer); finish(); }
+    }, 60);
   }
   // 切换/加载已有会话：遮罩 class 和欢迎条是 JS 挂在 body 上的外来状态，
   // st.rerun() 的 React 重渲染不会清它们，必须显式移除，否则旧会话消息被 CSS 隐藏成空白
   function restoreChat(c){
-    cleanupChat();
+    cleanupChat(false);
     var doc = win.document;
     // caption 曾被 clearChat 用 JS 直接改过文本，React 认为"没变"不会改回，这里手动同步
     var caps = doc.querySelectorAll("[data-testid='stMain'] [data-testid='stCaptionContainer']");
@@ -450,29 +462,33 @@ class MilvusLoveRAG:
             return self.client.get_collection_stats(self.collection).get("row_count", 0)
 
 
+# Milvus 调用专用单线程池：用 future.result(timeout=) 给不可强杀的 gRPC 调用
+# 套一层墙钟超时，Milvus 503/卡顿时连接与行数查询都只留在后台线程，不阻塞界面
+_MILVUS_COUNT_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='milvus-cnt')
+
+
 @st.cache_resource
 def get_milvus_rag():
     """Milvus 单例。按 EMBED_PROVIDERS 顺序尝试可用嵌入源；
-    全部失败（Milvus 未启动 / 无任何 key）时返回 None，自动降级关键词检索"""
+    全部失败（Milvus 未启动 / 无任何 key）时返回 None，自动降级关键词检索。
+    构造（list_databases/has_collection 等 gRPC）也限时 2.5 秒：超时即判定不可用并缓存
+    None，避免侧边栏每次 rerun 都被卡十几秒（503 时单次 gRPC 要 9 秒才报错）。"""
     for provider in EMBED_PROVIDERS:
         if not os.getenv(provider["key_env"]):
             continue
         try:
-            return MilvusLoveRAG(provider)
-        except Exception as e:
-            custom_toast(f"{provider['name']} 嵌入源不可用，尝试下一个", icon="⚠️")
+            return _MILVUS_COUNT_POOL.submit(MilvusLoveRAG, provider).result(timeout=2.5)
+        except FuturesTimeoutError:
+            return None  # 连不上就别再试了，本进程内直接走关键词检索降级
+        except Exception:
+            continue
     return None
 
 
-# Milvus 行数查询专用单线程池：用 future.result(timeout=) 给不可强杀的 gRPC 调用
-# 套一层墙钟超时，Milvus 503/卡顿时长查询只留在后台线程，不阻塞侧边栏 fragment
-_MILVUS_COUNT_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='milvus-cnt')
-
-
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def milvus_row_count(collection_name: str):
-    """行数查询走短时缓存；1.5 秒超时。Milvus 异常时侧边栏（新建/切换会话）不再被
-    同步卡 10 秒以上：返回 None 表示未知（UI 显示"统计中"），TTL 过期后自动重试。"""
+    """行数查询走短时缓存；1.5 秒超时。返回 None 表示 Milvus 不可用/超时
+    （UI 显示降级提示而非永久"统计中"），TTL 过期后自动重试。"""
     rag = get_milvus_rag()
     if rag is None:
         return 0
@@ -1386,7 +1402,10 @@ def sidebar_panel():
                 st.caption(f"源: {p['name']} | {p['model']}({p['dim']}维)")
                 st.caption(f"库: {MILVUS_DB}/{milvus_rag.collection}")
                 _row_cnt = milvus_row_count(milvus_rag.collection)
-                st.caption(f"已入库知识块: **{_row_cnt if _row_cnt is not None else '统计中…'}**")
+                if _row_cnt is None:
+                    st.caption('已入库知识块: **暂不可用**（Milvus 连接超时/503，对话已降级关键词检索，稍后自动重试）')
+                else:
+                    st.caption(f"已入库知识块: **{_row_cnt}**")
                 if st.button('重建并同步 knowledge.txt 到 Milvus', width='stretch', icon='🔄'):
                     with st.spinner('正在重建集合、切分、嵌入并写入 Milvus...'):
                         count = milvus_rag.ingest_file(recreate=True)
